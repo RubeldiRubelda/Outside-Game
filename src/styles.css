@@ -136,6 +136,12 @@ select:focus {
   margin: 0;
 }
 
+.card-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
 h1,
 h2,
 h3,
@@ -366,6 +372,47 @@ label {
   padding: 16px;
 }
 
+.warning-card,
+.alert-card {
+  border-color: rgba(255, 179, 102, 0.36);
+  background: rgba(63, 33, 10, 0.8);
+}
+
+.alert-card {
+  box-shadow: 0 0 0 1px rgba(255, 179, 102, 0.18), var(--shadow);
+}
+
+.qr-card {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 18px;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(7, 14, 27, 0.76);
+}
+
+.qr-card canvas {
+  width: 180px !important;
+  height: 180px !important;
+  border-radius: 16px;
+  background: #ffffff;
+  padding: 8px;
+}
+
+.qr-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  text-align: left;
+  width: 100%;
+}
+
+.qr-card-head .material-icons {
+  font-size: 2rem;
+  color: var(--accent-2);
+}
+
 .mini-card strong,
 .team-card strong {
   display: block;
@@ -376,6 +423,13 @@ label {
 .status-card-grid,
 .admin-banner-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
+.qr-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
   margin-top: 12px;
 }
 
@@ -573,6 +627,15 @@ label {
   color: var(--muted);
 }
 
+.primary .material-icons,
+.secondary .material-icons,
+.danger .material-icons,
+.button .material-icons {
+  font-size: 1.05rem;
+  margin-right: 0.35rem;
+  vertical-align: middle;
+}
+
 .footer {
   display: flex;
   flex-wrap: wrap;
@@ -621,7 +684,8 @@ label {
   .admin-banner-grid,
   .form-grid,
   .tabs,
-  .quick-grid {
+  .quick-grid,
+  .qr-grid {
     grid-template-columns: 1fr;
   }
 

@@ -72,8 +72,9 @@ const TEAM_META: Record<TeamId, { name: string; accent: string; label: string }>
 
 function QrCodeView({ code, teamId }: { code: string; teamId: TeamId }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const teamUrl = new URL(window.location.href);
-  teamUrl.search = '';
+  const teamMeta = TEAM_META[teamId];
+  const teamUrl = new URL(window.location.origin);
+  teamUrl.pathname = '/';
   teamUrl.searchParams.set('code', code);
 
   useEffect(() => {
@@ -90,9 +91,16 @@ function QrCodeView({ code, teamId }: { code: string; teamId: TeamId }) {
   }, [code, teamUrl]);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+    <div className="qr-card">
+      <div className="qr-card-head">
+        <span className="material-icons">qr_code_2</span>
+        <div>
+          <p className="card-label">{teamMeta.name}</p>
+          <strong>{code || 'Noch kein Code'}</strong>
+        </div>
+      </div>
       <canvas ref={canvasRef} />
-      <strong>{code}</strong>
+      <p className="muted">Scannt direkt ins Join-Feld statt den Code einzutippen.</p>
     </div>
   );
 }
@@ -270,14 +278,26 @@ export default function App() {
   const [adminLeader, setAdminLeader] = useState<TeamId>('red');
   const [locationPermission, setLocationPermission] = useState<'unknown' | 'prompting' | 'granted' | 'denied'>('unknown');
   const [adminCodes, setAdminCodes] = useState<Partial<Record<TeamId, string>>>({});
-  const [headStartRemaining, setHeadStartRemaining] = useState<string | null>(null);
 
   const isPlayer = mode === 'player';
   const isAdmin = mode === 'admin';
 
   const currentState = snapshot;
+  const latestEvent = currentState?.events?.[0] ?? null;
   const activeTeam = currentState ? currentState.teams[teamId] : null;
   const targetCheckpoint = currentState?.currentCheckpoint?.location || null;
+  const headStartSummary = useMemo(() => {
+    if (!currentState || currentState.status !== 'head_start' || !currentState.headStartEndsAt) {
+      return null;
+    }
+
+    const remainingMs = new Date(currentState.headStartEndsAt).getTime() - nowMs;
+    return {
+      remainingMs,
+      remainingText: formatDuration(Math.max(0, remainingMs)),
+      expired: remainingMs <= 0,
+    };
+  }, [currentState?.status, currentState?.headStartEndsAt, nowMs]);
 
   const viewStateText = useMemo(() => {
     if (!currentState) {
@@ -289,11 +309,15 @@ export default function App() {
     }
 
     if (currentState.status === 'head_start') {
-      return `Vorsprung läuft für ${TEAM_META[currentState.leadingTeamId].name}`;
+      if (headStartSummary?.expired) {
+        return `Vorsprung abgelaufen. Jetzt ist ${TEAM_META[currentState.activeTeamId].name} dran.`;
+      }
+
+      return `Vorsprung läuft für ${TEAM_META[currentState.leadingTeamId].name} · noch ${headStartSummary?.remainingText ?? '…'}`;
     }
 
     return `Jagd läuft. Dran ist ${TEAM_META[currentState.activeTeamId].name}`;
-  }, [currentState]);
+  }, [currentState, headStartSummary?.expired, headStartSummary?.remainingText]);
 
   useEffect(() => {
     if (!photoPreview) {
@@ -307,6 +331,19 @@ export default function App() {
     alertAudioRef.current = new Audio('/alert.mp3');
     alertAudioRef.current.preload = 'auto';
   }, []);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const playImportantAlert = () => {
+    const audio = alertAudioRef.current;
+    if (audio) {
+      audio.currentTime = 0;
+      void audio.play().catch(() => undefined);
+    }
+  };
 
   useEffect(() => {
     const socket = io({ transports: ['websocket'] });
@@ -366,60 +403,41 @@ export default function App() {
   }, [connected, isPlayer, gameCode]);
 
   useEffect(() => {
-    const currentEventId = currentState?.events?.[0]?.id ?? null;
-    if (!currentEventId) {
+    if (!latestEvent?.id) {
       return;
     }
 
     if (lastAlertEventIdRef.current === null) {
-      lastAlertEventIdRef.current = currentEventId;
+      lastAlertEventIdRef.current = latestEvent.id;
       return;
     }
 
-    if (lastAlertEventIdRef.current === currentEventId) {
+    if (lastAlertEventIdRef.current === latestEvent.id) {
       return;
     }
 
-    lastAlertEventIdRef.current = currentEventId;
-    const eventType = currentState?.events?.[0]?.type;
+    lastAlertEventIdRef.current = latestEvent.id;
 
-    const shouldAlert = eventType === 'game-start' || eventType === 'photo-upload';
-
-    if (shouldAlert) {
-      const audio = alertAudioRef.current;
-      if (audio) {
-        audio.currentTime = 0;
-        void audio.play().catch(() => undefined);
-      }
+    if (latestEvent.type === 'game-start' || latestEvent.type === 'photo-upload') {
+      playImportantAlert();
     }
-  }, [currentState?.events?.[0]?.id]);
+  }, [latestEvent?.id, latestEvent?.type]);
 
   useEffect(() => {
     if (currentState?.status !== 'head_start' || !currentState.headStartEndsAt) {
-      setHeadStartRemaining(null);
+      headStartAlertedRef.current = false;
       return undefined;
     }
 
-    const interval = setInterval(() => {
-      const endsAt = new Date(currentState.headStartEndsAt!).getTime();
-      const remaining = endsAt - Date.now();
-      if (remaining <= 0) {
-        setHeadStartRemaining(null);
-        if (!headStartAlertedRef.current) {
-          const audio = alertAudioRef.current;
-          if (audio) {
-            audio.currentTime = 0;
-            void audio.play().catch(() => undefined);
-          }
-          headStartAlertedRef.current = true;
-        }
-      } else {
-        setHeadStartRemaining(formatDuration(remaining));
-      }
-    }, 1000);
+    if (headStartSummary?.expired && !headStartAlertedRef.current) {
+      playImportantAlert();
+      headStartAlertedRef.current = true;
+    }
 
-    return () => clearInterval(interval);
-  }, [currentState?.status, currentState?.headStartEndsAt]);
+    if (!headStartSummary?.expired) {
+      headStartAlertedRef.current = false;
+    }
+  }, [currentState?.status, currentState?.headStartEndsAt, headStartSummary?.expired]);
 
   // check whether an admin password has been set on the server
   useEffect(() => {
@@ -748,23 +766,23 @@ export default function App() {
       <section className="panel" style={{ maxWidth: 560, margin: '24px auto', display: 'grid', gap: 14 }}>
         <div className="section-head">
           <div>
-            <p className="card-label">Team</p>
+            <p className="card-label"><span className="material-icons">sports_soccer</span> Team</p>
             <h2>{activeTeam?.name ?? TEAM_META[teamId].name}</h2>
           </div>
           <span className="status-chip" style={{ borderColor: TEAM_META[teamId].accent, color: TEAM_META[teamId].accent }}>{TEAM_META[teamId].label}</span>
         </div>
 
         <div className="status-card-grid">
-          <div className="mini-card"><span className="card-label">Standort</span><strong>{locationPermission === 'granted' ? 'erlaubt' : introHint}</strong></div>
-          <div className="mini-card"><span className="card-label">Letztes Foto</span><strong>{activeTeam?.lastUpload ? formatDateTime(activeTeam.lastUpload.createdAt) : 'noch keines'}</strong></div>
-          <div className="mini-card"><span className="card-label">Zeit</span><strong>{formatTime(location?.time)}</strong></div>
+          <div className="mini-card"><span className="card-label"><span className="material-icons">my_location</span> Standort</span><strong>{locationPermission === 'granted' ? 'erlaubt' : introHint}</strong></div>
+          <div className="mini-card"><span className="card-label"><span className="material-icons">photo_camera</span> Letztes Foto</span><strong>{activeTeam?.lastUpload ? formatDateTime(activeTeam.lastUpload.createdAt) : 'noch keines'}</strong></div>
+          <div className={`mini-card ${headStartSummary?.expired ? 'warning-card' : ''}`}><span className="card-label"><span className="material-icons">timer</span> Vorsprung</span><strong>{currentState?.status === 'head_start' ? (headStartSummary?.expired ? 'abgelaufen' : headStartSummary?.remainingText ?? '…') : 'bereits vorbei'}</strong></div>
         </div>
 
         {currentState?.status === 'head_start' && (
-          <div className="card">
-            <h3>Vorsprung aktiv</h3>
-            <div className="countdown" style={{ fontSize: '2.5rem', margin: '1rem 0' }}>{headStartRemaining}</div>
-            <p>Macht euch bereit, das andere Team auszuspionieren, sobald das Spiel live geht.</p>
+          <div className={`card ${headStartSummary?.expired ? 'alert-card' : ''}`}>
+            <h3>{headStartSummary?.expired ? 'Jetzt ist Aktion nötig' : 'Vorsprung aktiv'}</h3>
+            <div className="countdown" style={{ fontSize: '2.5rem', margin: '1rem 0' }}>{headStartSummary?.remainingText ?? '…'}</div>
+            <p>{headStartSummary?.expired ? 'Der Vorsprung ist abgelaufen. Jetzt muss das nächste Foto gesendet werden.' : 'Nutze die Zeit, bevor das andere Team wieder dran ist.'}</p>
           </div>
         )}
 
@@ -795,7 +813,7 @@ export default function App() {
                 Standort freigeben
               </button>
             </div>
-            <p className="muted">{currentState?.status === 'head_start' ? 'Der Vorsprung läuft noch.' : 'Ein Foto reicht zur Bestätigung.'}</p>
+            <p className="muted">{currentState?.status === 'head_start' ? (headStartSummary?.expired ? 'Der Vorsprung ist abgelaufen.' : 'Der Vorsprung läuft noch.') : 'Ein Foto reicht zur Bestätigung.'}</p>
           </div>
         )}
       </section>
@@ -864,9 +882,9 @@ export default function App() {
             </div>
 
             <div className="admin-banner-grid">
-              <div className="mini-card"><span className="card-label">Startteam</span><strong>{TEAM_META[currentState?.leadingTeamId ?? 'red'].name}</strong></div>
-              <div className="mini-card"><span className="card-label">Aktives Team</span><strong>{TEAM_META[currentState?.activeTeamId ?? 'red'].name}</strong></div>
-              <div className="mini-card"><span className="card-label">Vorsprung</span><strong>{currentState?.headStartMinutes ?? 5} Minuten</strong></div>
+              <div className="mini-card"><span className="card-label"><span className="material-icons">flag</span> Startteam</span><strong>{TEAM_META[currentState?.leadingTeamId ?? 'red'].name}</strong></div>
+              <div className="mini-card"><span className="card-label"><span className="material-icons">swap_horiz</span> Aktives Team</span><strong>{TEAM_META[currentState?.activeTeamId ?? 'red'].name}</strong></div>
+              <div className={`mini-card ${headStartSummary?.expired ? 'warning-card' : ''}`}><span className="card-label"><span className="material-icons">timer</span> Vorsprung</span><strong>{currentState?.status === 'head_start' ? (headStartSummary?.expired ? 'abgelaufen' : headStartSummary?.remainingText ?? '…') : `${currentState?.headStartMinutes ?? 5} Minuten`}</strong></div>
             </div>
 
             <div className="form-grid admin-form">
@@ -892,6 +910,11 @@ export default function App() {
             <div className="status-card-grid">
               <div className="mini-card"><span className="card-label">Rot-Code</span><strong>{adminCodes.red || 'noch keiner'}</strong></div>
               <div className="mini-card"><span className="card-label">Blau-Code</span><strong>{adminCodes.blue || 'noch keiner'}</strong></div>
+            </div>
+
+            <div className="qr-grid">
+              <QrCodeView code={adminCodes.red || ''} teamId="red" />
+              <QrCodeView code={adminCodes.blue || ''} teamId="blue" />
             </div>
 
             <div className="status-card-grid admin-stats">
@@ -947,14 +970,20 @@ export default function App() {
   return (
     <main className="shell">
       {mode === 'intro' ? (
-        <section className="panel" style={{ display: 'grid', gap: 8, maxWidth: 420, margin: '32px auto' }}>
+        <section className="panel intro-panel" style={{ display: 'grid', gap: 8, maxWidth: 420, margin: '32px auto' }}>
+          <div className="section-head">
+            <div>
+              <p className="card-label"><span className="material-icons">qr_code_2</span> Join</p>
+              <h2>Code oder QR</h2>
+            </div>
+          </div>
           <label style={{ display: 'contents' }}>
             <input value={gameCode} onChange={(e) => setGameCode(e.target.value)} placeholder="Spielcode" autoFocus />
           </label>
           <div className="pill">{introHint}</div>
           <div className="button-row">
-            <button className="secondary" onClick={requestLocationAccess}>Standort freigeben</button>
-            <button className="primary" onClick={joinAsPlayer}>Beitreten</button>
+            <button className="secondary" onClick={requestLocationAccess}><span className="material-icons">my_location</span> Standort freigeben</button>
+            <button className="primary" onClick={joinAsPlayer}><span className="material-icons">login</span> Beitreten</button>
           </div>
         </section>
       ) : null}
