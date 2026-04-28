@@ -413,6 +413,35 @@ label {
   color: var(--accent-2);
 }
 
+.map-shell {
+  height: 420px;
+  overflow: hidden;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(7, 14, 27, 0.76);
+}
+
+.leaflet-map {
+  height: 100%;
+  width: 100%;
+}
+
+.challenge-card,
+.review-card,
+.muted-card {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(7, 14, 27, 0.76);
+}
+
+.challenge-preview {
+  max-height: 340px;
+  object-fit: cover;
+}
+
 .mini-card strong,
 .team-card strong {
   display: block;

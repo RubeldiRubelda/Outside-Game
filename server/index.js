@@ -41,6 +41,7 @@ function createState() {
     headStartEndsAt: null,
     startedAt: null,
     currentCheckpoint: null,
+    pendingReview: null,
     events: [],
     settings: {
       captureRadiusMeters: CHEAT_RADIUS_METERS,
@@ -136,6 +137,7 @@ function computePublicState() {
     headStartEndsAt: state.headStartEndsAt,
     startedAt: state.startedAt,
     currentCheckpoint: state.currentCheckpoint,
+    pendingReview: state.pendingReview,
     events: state.events,
     settings: state.settings,
     teams: {
@@ -196,6 +198,7 @@ function startGame(io, options = {}) {
   state.startedAt = nowIso();
   state.headStartEndsAt = new Date(Date.now() + state.headStartMinutes * 60_000).toISOString();
   state.currentCheckpoint = null;
+  state.pendingReview = null;
   state.teams.red.lastUpload = null;
   state.teams.blue.lastUpload = null;
   pushEvent('game-start', `Spiel gestartet. ${state.teams[state.leadingTeamId].name} hat den Vorsprung.`, {
@@ -213,6 +216,7 @@ function resetGame() {
   state.headStartEndsAt = nextState.headStartEndsAt;
   state.startedAt = nextState.startedAt;
   state.currentCheckpoint = nextState.currentCheckpoint;
+  state.pendingReview = nextState.pendingReview;
   state.events = nextState.events;
   state.settings = nextState.settings;
   state.teams.red = nextState.teams.red;
@@ -221,6 +225,10 @@ function resetGame() {
 }
 
 function canUpload(teamId) {
+  if (state.status === 'review' || state.pendingReview) {
+    return { ok: false, message: 'Ein Bild wird gerade geprüft. Erst nach Annahme oder Ablehnung geht es weiter.' };
+  }
+
   if (state.status === 'lobby') {
     return { ok: false, message: 'Das Spiel wurde noch nicht gestartet.' };
   }
@@ -266,6 +274,18 @@ function resolveCheckpointCheck(teamId, location) {
 function sanitizeText(input, fallback) {
   const trimmed = String(input ?? '').trim();
   return trimmed.length > 0 ? trimmed.slice(0, 80) : fallback;
+}
+
+function toCheckpoint(photo, team) {
+  return {
+    id: photo.id,
+    teamId: photo.uploadTeamId,
+    teamName: team.name,
+    location: photo.location || team.lastPosition,
+    uploadedAt: photo.createdAt,
+    caption: photo.caption,
+    preview: photo.dataUrl,
+  };
 }
 
 async function main() {
@@ -509,25 +529,80 @@ async function main() {
 
       team.lastUpload = photo;
       team.checkpoints += 1;
-      state.currentCheckpoint = {
-        id: photo.id,
-        teamId,
-        teamName: team.name,
-        location: location || team.lastPosition,
-        uploadedAt: photo.createdAt,
-        caption: photo.caption,
-        preview: photo.dataUrl,
-      };
       state.status = 'live';
-      state.activeTeamId = otherTeamId(teamId);
       if (state.status === 'head_start' && Date.now() >= new Date(state.headStartEndsAt).getTime()) {
         state.status = 'live';
       }
 
-      pushEvent('photo-upload', `${team.name} hat einen Standort hochgeladen. Jetzt ist ${state.teams[state.activeTeamId].name} dran.`, {
-        teamId,
-        checkpointDistanceMeters: positionCheck.distanceMeters,
-      });
+      const isResponseRound = state.currentCheckpoint && state.currentCheckpoint.teamId !== teamId;
+
+      if (isResponseRound) {
+        state.pendingReview = {
+          id: photo.id,
+          reviewTeamId: state.currentCheckpoint.teamId,
+          uploadTeamId: teamId,
+          checkpoint: toCheckpoint(photo, team),
+        };
+        state.status = 'review';
+        state.activeTeamId = state.currentCheckpoint.teamId;
+        pushEvent('photo-review-pending', `${team.name} hat ein Antwortbild gesendet. ${state.teams[state.activeTeamId].name} muss jetzt annehmen oder ablehnen.`, {
+          teamId,
+          reviewTeamId: state.activeTeamId,
+          checkpointDistanceMeters: positionCheck.distanceMeters,
+        });
+      } else {
+        state.currentCheckpoint = toCheckpoint(photo, team);
+        state.activeTeamId = otherTeamId(teamId);
+        pushEvent('photo-upload', `${team.name} hat ein Bild gepostet. Jetzt ist ${state.teams[state.activeTeamId].name} dran.`, {
+          teamId,
+          checkpointDistanceMeters: positionCheck.distanceMeters,
+        });
+      }
+
+      callback({ ok: true, state: computePublicState() });
+      broadcast(io);
+    });
+
+    socket.on('player:review', (payload = {}, callback = () => {}) => {
+      const teamId = socket.data.teamId;
+      if (!TEAM_IDS.includes(teamId)) {
+        callback({ ok: false, message: 'Nur Teams dürfen prüfen.' });
+        return;
+      }
+
+      if (!state.pendingReview) {
+        callback({ ok: false, message: 'Es liegt gerade kein Bild zur Prüfung vor.' });
+        return;
+      }
+
+      if (state.pendingReview.reviewTeamId !== teamId) {
+        callback({ ok: false, message: 'Nur das angefragte Team darf dieses Bild prüfen.' });
+        return;
+      }
+
+      const action = payload.action === 'reject' ? 'reject' : 'accept';
+      const review = state.pendingReview;
+      const reviewerTeam = state.teams[teamId];
+      const uploaderTeam = state.teams[review.uploadTeamId];
+
+      if (action === 'accept') {
+        state.currentCheckpoint = review.checkpoint;
+        state.activeTeamId = teamId;
+        state.pendingReview = null;
+        state.status = 'live';
+        pushEvent('photo-approved', `${reviewerTeam.name} hat das Bild von ${uploaderTeam.name} angenommen.`, {
+          reviewTeamId: teamId,
+          uploadTeamId: review.uploadTeamId,
+        });
+      } else {
+        state.pendingReview = null;
+        state.activeTeamId = review.uploadTeamId;
+        state.status = 'live';
+        pushEvent('photo-rejected', `${reviewerTeam.name} hat das Bild von ${uploaderTeam.name} abgelehnt.`, {
+          reviewTeamId: teamId,
+          uploadTeamId: review.uploadTeamId,
+        });
+      }
 
       callback({ ok: true, state: computePublicState() });
       broadcast(io);

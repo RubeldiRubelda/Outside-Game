@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import { CircleMarker, MapContainer, Popup, TileLayer, Tooltip, useMap } from 'react-leaflet';
 import QRCode from 'qrcode';
+import 'leaflet/dist/leaflet.css';
 
 type TeamId = 'red' | 'blue';
 type ViewMode = 'intro' | 'player' | 'admin';
@@ -37,22 +39,32 @@ type PhotoRecord = {
   checkpointDistanceMeters: number | null;
 };
 
+type CheckpointPhoto = {
+  id: string;
+  teamId: TeamId;
+  teamName: string;
+  location: Position | null;
+  uploadedAt: string;
+  caption: string;
+  preview: string | null;
+};
+
+type PendingReview = {
+  id: string;
+  reviewTeamId: TeamId;
+  uploadTeamId: TeamId;
+  checkpoint: CheckpointPhoto;
+};
+
 type Snapshot = {
-  status: 'lobby' | 'head_start' | 'live';
+  status: 'lobby' | 'head_start' | 'live' | 'review';
   leadingTeamId: TeamId;
   activeTeamId: TeamId;
   headStartMinutes: number;
   headStartEndsAt: string | null;
   startedAt: string | null;
-  currentCheckpoint: null | {
-    id: string;
-    teamId: TeamId;
-    teamName: string;
-    location: Position | null;
-    uploadedAt: string;
-    caption: string;
-    preview: string | null;
-  };
+  currentCheckpoint: CheckpointPhoto | null;
+  pendingReview: PendingReview | null;
   events: Array<{ id: string; type: string; message: string; details: Record<string, unknown>; time: string }>;
   settings: {
     captureRadiusMeters: number;
@@ -101,6 +113,115 @@ function QrCodeView({ code, teamId }: { code: string; teamId: TeamId }) {
       </div>
       <canvas ref={canvasRef} />
       <p className="muted">Scannt direkt ins Join-Feld statt den Code einzutippen.</p>
+    </div>
+  );
+}
+
+function MapBoundsUpdater({ points, center }: { points: Array<[number, number]>; center: [number, number] }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (points.length === 0) {
+      map.setView(center, 14);
+      return;
+    }
+
+    map.fitBounds(points, { padding: [40, 40], maxZoom: 17 });
+  }, [center, map, points]);
+
+  return null;
+}
+
+function OpenStreetMapView({ state }: { state: Snapshot | null }) {
+  const fallbackCenter: [number, number] = [48.137154, 11.576124];
+
+  const center = useMemo<[number, number]>(() => {
+    const checkpoint = state?.currentCheckpoint?.location;
+    if (checkpoint) {
+      return [checkpoint.lat, checkpoint.lng];
+    }
+
+    const knownPositions = (['red', 'blue'] as TeamId[])
+      .map((teamId) => state?.teams[teamId]?.lastPosition)
+      .filter(Boolean) as Position[];
+
+    if (knownPositions.length > 0) {
+      const sumLat = knownPositions.reduce((sum, position) => sum + position.lat, 0);
+      const sumLng = knownPositions.reduce((sum, position) => sum + position.lng, 0);
+      return [sumLat / knownPositions.length, sumLng / knownPositions.length];
+    }
+
+    return fallbackCenter;
+  }, [state]);
+
+  const points = useMemo(() => {
+    const nextPoints: Array<{ id: string; position: [number, number]; label: string; color: string; type: 'team' | 'checkpoint' | 'review' }> = [];
+
+    if (state?.currentCheckpoint?.location) {
+      nextPoints.push({
+        id: 'checkpoint',
+        position: [state.currentCheckpoint.location.lat, state.currentCheckpoint.location.lng],
+        label: `Ziel: ${state.currentCheckpoint.teamName}`,
+        color: '#f9c74f',
+        type: 'checkpoint',
+      });
+    }
+
+    if (state?.pendingReview?.checkpoint.location) {
+      nextPoints.push({
+        id: 'review',
+        position: [state.pendingReview.checkpoint.location.lat, state.pendingReview.checkpoint.location.lng],
+        label: 'Prüfung wartet',
+        color: '#ff7b7b',
+        type: 'review',
+      });
+    }
+
+    (['red', 'blue'] as TeamId[]).forEach((teamId) => {
+      const position = state?.teams[teamId]?.lastPosition;
+      if (!position) {
+        return;
+      }
+
+      nextPoints.push({
+        id: teamId,
+        position: [position.lat, position.lng],
+        label: state?.teams[teamId]?.name || teamId,
+        color: state?.teams[teamId]?.color || '#ffffff',
+        type: 'team',
+      });
+    });
+
+    return nextPoints;
+  }, [state]);
+
+  return (
+    <div className="map-shell">
+      <MapContainer center={center} zoom={14} scrollWheelZoom className="leaflet-map">
+        <MapBoundsUpdater points={points.map((point) => point.position)} center={center} />
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        />
+        {points.map((point) => (
+          <CircleMarker
+            key={point.id}
+            center={point.position}
+            radius={point.type === 'checkpoint' ? 12 : point.type === 'review' ? 10 : 8}
+            pathOptions={{
+              color: point.color,
+              fillColor: point.color,
+              fillOpacity: point.type === 'checkpoint' ? 0.7 : 0.5,
+              weight: 3,
+            }}
+          >
+            <Tooltip direction="top" offset={[0, -8]} opacity={1} permanent={point.type === 'checkpoint'}>
+              {point.label}
+            </Tooltip>
+            <Popup>{point.label}</Popup>
+          </CircleMarker>
+        ))}
+      </MapContainer>
     </div>
   );
 }
@@ -198,15 +319,6 @@ function distanceMeters(a: Position | null, b: Position | null) {
   const sinLng = Math.sin(deltaLng / 2);
   const aValue = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLng * sinLng;
   return 2 * earthRadius * Math.asin(Math.min(1, Math.sqrt(aValue)));
-}
-
-function bearingDegrees(from: Position, to: Position) {
-  const lat1 = (from.lat * Math.PI) / 180;
-  const lat2 = (to.lat * Math.PI) / 180;
-  const deltaLng = ((to.lng - from.lng) * Math.PI) / 180;
-  const y = Math.sin(deltaLng) * Math.cos(lat2);
-  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(deltaLng);
-  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
 }
 
 function buildUrl(mode: ViewMode, teamId?: TeamId) {
@@ -316,6 +428,10 @@ export default function App() {
       return `Vorsprung läuft für ${TEAM_META[currentState.leadingTeamId].name} · noch ${headStartSummary?.remainingText ?? '…'}`;
     }
 
+    if (currentState.status === 'review') {
+      return `Bild wird geprüft. Dran ist ${TEAM_META[currentState.activeTeamId].name}`;
+    }
+
     return `Jagd läuft. Dran ist ${TEAM_META[currentState.activeTeamId].name}`;
   }, [currentState, headStartSummary?.expired, headStartSummary?.remainingText]);
 
@@ -418,7 +534,7 @@ export default function App() {
 
     lastAlertEventIdRef.current = latestEvent.id;
 
-    if (latestEvent.type === 'game-start' || latestEvent.type === 'photo-upload') {
+    if (latestEvent.type === 'game-start' || latestEvent.type === 'photo-upload' || latestEvent.type === 'photo-review-pending' || latestEvent.type === 'photo-approved' || latestEvent.type === 'photo-rejected') {
       playImportantAlert();
     }
   }, [latestEvent?.id, latestEvent?.type]);
@@ -649,6 +765,21 @@ export default function App() {
     }
   };
 
+  const sendReviewDecision = (action: 'accept' | 'reject') => {
+    socketRef.current?.emit(
+      'player:review',
+      { action },
+      (response: JoinResult) => {
+        if (response.ok && response.state) {
+          setSnapshot(response.state);
+          setMessage(action === 'accept' ? 'Bild angenommen.' : 'Bild abgelehnt.');
+        } else {
+          setMessage(response.message || 'Prüfung fehlgeschlagen.');
+        }
+      },
+    );
+  };
+
   const startGame = () => {
     socketRef.current?.emit(
       'admin:start',
@@ -721,35 +852,13 @@ export default function App() {
     return distanceMeters(location, targetCheckpoint);
   }, [location, targetCheckpoint]);
 
-  const markerPositions = useMemo(() => {
-    if (!currentState?.currentCheckpoint?.location) {
-      return [] as Array<{ id: TeamId | 'checkpoint'; x: number; y: number; label: string; color: string }>;
-    }
-
-    const center = currentState.currentCheckpoint.location;
-    return (['red', 'blue'] as TeamId[])
-      .map((id) => {
-        const position = currentState.teams[id].lastPosition;
-        if (!position) {
-          return null;
-        }
-
-        const distance = Math.min(250, (distanceMeters(center, position) || 0) / 12);
-        const angle = (bearingDegrees(center, position) * Math.PI) / 180;
-        return {
-          id,
-          x: Math.cos(angle) * distance,
-          y: Math.sin(angle) * distance,
-          label: currentState.teams[id].name,
-          color: currentState.teams[id].color,
-        };
-      })
-      .filter(Boolean) as Array<{ id: TeamId | 'checkpoint'; x: number; y: number; label: string; color: string }>;
-  }, [currentState]);
-
   const checkpointLabel = currentState?.currentCheckpoint
     ? `${currentState.currentCheckpoint.teamName} · ${formatDateTime(currentState.currentCheckpoint.uploadedAt)}`
     : 'Noch kein Startfoto hochgeladen';
+  
+  const isActiveTeamTurn = currentState?.activeTeamId === teamId;
+  const pendingReview = currentState?.pendingReview;
+  const isReviewTeam = pendingReview?.reviewTeamId === teamId;
 
   const introHint = locationPermission === 'prompting'
     ? 'Standort wird angefragt…'
@@ -778,6 +887,46 @@ export default function App() {
           <div className={`mini-card ${headStartSummary?.expired ? 'warning-card' : ''}`}><span className="card-label"><span className="material-icons">timer</span> Vorsprung</span><strong>{currentState?.status === 'head_start' ? (headStartSummary?.expired ? 'abgelaufen' : headStartSummary?.remainingText ?? '…') : 'bereits vorbei'}</strong></div>
         </div>
 
+        {currentState?.currentCheckpoint?.preview ? (
+          <div className="challenge-card">
+            <div className="section-head">
+              <div>
+                <p className="card-label"><span className="material-icons">image</span> Aktuelles Bild</p>
+                <h3>{checkpointLabel}</h3>
+              </div>
+              <span className="status-chip">{isActiveTeamTurn ? 'Ihr seid dran' : 'Gegner muss lösen'}</span>
+            </div>
+            <img className="photo-preview challenge-preview" src={currentState.currentCheckpoint.preview} alt={currentState.currentCheckpoint.caption || 'Aktuelles Spielbild'} />
+            <p className="muted">{isActiveTeamTurn ? 'Findet den Ort und sendet danach ein Bild zurück.' : 'Das andere Team rätselt gerade über dieses Bild.'}</p>
+          </div>
+        ) : null}
+
+        {currentState?.status === 'review' && isReviewTeam && pendingReview?.checkpoint.preview ? (
+          <div className="challenge-card review-card">
+            <div className="section-head">
+              <div>
+                <p className="card-label"><span className="material-icons">rule</span> Rücksendung prüfen</p>
+                <h3>{TEAM_META[pendingReview.uploadTeamId].name} hat geantwortet</h3>
+              </div>
+              <span className="status-chip" style={{ borderColor: TEAM_META[teamId].accent, color: TEAM_META[teamId].accent }}>Review</span>
+            </div>
+            <img className="photo-preview challenge-preview" src={pendingReview.checkpoint.preview} alt="Antwortbild zur Prüfung" />
+            <p className="muted">Wenn der Ort stimmt, das Bild annehmen. Sonst ablehnen und nochmal probieren lassen.</p>
+            <div className="button-row">
+              <button className="primary" onClick={() => sendReviewDecision('accept')}><span className="material-icons">check_circle</span>Annehmen</button>
+              <button className="danger" onClick={() => sendReviewDecision('reject')}><span className="material-icons">cancel</span>Ablehnen</button>
+            </div>
+          </div>
+        ) : null}
+
+        {currentState?.status === 'review' && !isReviewTeam && pendingReview ? (
+          <div className="challenge-card review-card muted-card">
+            <p className="card-label"><span className="material-icons">hourglass_top</span> Warten auf Prüfung</p>
+            <h3>{TEAM_META[pendingReview.reviewTeamId].name} prüft gerade das Rückbild</h3>
+            <p className="muted">Sobald angenommen oder abgelehnt wurde, startet die nächste Runde sofort.</p>
+          </div>
+        ) : null}
+
         {currentState?.status === 'head_start' && (
           <div className={`card ${headStartSummary?.expired ? 'alert-card' : ''}`}>
             <h3>{headStartSummary?.expired ? 'Jetzt ist Aktion nötig' : 'Vorsprung aktiv'}</h3>
@@ -786,7 +935,7 @@ export default function App() {
           </div>
         )}
 
-        {currentState?.status === 'live' && (
+        {currentState?.status === 'live' && isActiveTeamTurn && !pendingReview && (
           <div className="upload-panel">
             <label className="button primary">
               <span className="material-icons">photo_camera</span>
@@ -816,6 +965,14 @@ export default function App() {
             <p className="muted">{currentState?.status === 'head_start' ? (headStartSummary?.expired ? 'Der Vorsprung ist abgelaufen.' : 'Der Vorsprung läuft noch.') : 'Ein Foto reicht zur Bestätigung.'}</p>
           </div>
         )}
+
+        {currentState?.status === 'live' && !isActiveTeamTurn && !pendingReview ? (
+          <div className="challenge-card muted-card">
+            <p className="card-label"><span className="material-icons">visibility</span> Beobachten</p>
+            <h3>Warte auf die nächste Rückmeldung</h3>
+            <p className="muted">Ihr seht hier das Bild des anderen Teams, bis eure Runde wieder startet.</p>
+          </div>
+        ) : null}
       </section>
     );
   } else if (isAdmin) {
@@ -941,16 +1098,15 @@ export default function App() {
 
           <aside className="side-column admin-side">
             <article className="panel">
-              <h3>Checkpoint-Radar</h3>
-              <div className="radar radar-admin">
-                <div className="radar-ring radar-ring-one" />
-                <div className="radar-ring radar-ring-two" />
-                <div className="radar-core">{currentState?.currentCheckpoint ? 'Ziel' : 'Leerer Start'}</div>
-                {markerPositions.length > 0 ? markerPositions.map((marker) => (
-                  <div key={marker.id} className="radar-dot" style={{ transform: `translate(${marker.x}px, ${marker.y}px)`, borderColor: marker.color }}><span>{marker.label}</span></div>
-                )) : <div className="radar-empty">Noch kein Zielpunkt vorhanden</div>}
+              <div className="section-head">
+                <div>
+                  <p className="card-label"><span className="material-icons">map</span> Admin-Karte</p>
+                  <h3>OpenStreetMap Live View</h3>
+                </div>
+                <span className="status-chip">{currentState?.pendingReview ? 'Review aktiv' : 'Live'}</span>
               </div>
-              <p className="muted">Der Punkt in der Mitte ist der letzte gültige Upload. Die Dots zeigen die Teams relativ dazu.</p>
+              <OpenStreetMapView state={currentState} />
+              <p className="muted">Die Karte zeigt aktuelle Teampositionen, das Zielbild und einen offenen Prüfstatus, falls ein Rückbild noch bestätigt werden muss.</p>
             </article>
 
             <article className="panel">
