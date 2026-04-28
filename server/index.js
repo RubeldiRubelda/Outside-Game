@@ -55,6 +55,21 @@ function createState() {
 }
 
 const state = createState();
+const codes = {}; // map gameCode -> { createdAt, teamId, members: { socketId: teamId }, teams: { red: [socketIds], blue: [socketIds] } }
+
+function generateCode(length = 6) {
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let out = '';
+  for (let i = 0; i < length; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+function createTeamCode(teamId) {
+  let next = generateCode();
+  while (codes[next]) next = generateCode();
+  codes[next] = { createdAt: nowIso(), teamId, members: {}, teams: { red: [], blue: [] } };
+  return next;
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -133,7 +148,6 @@ function computePublicState() {
 function computeAdminState() {
   return {
     ...computePublicState(),
-    adminToken,
     teams: {
       red: {
         ...computePublicTeam(state.teams.red),
@@ -234,7 +248,7 @@ function resolveCheckpointCheck(teamId, location) {
   }
 
   if (!location) {
-    return { ok: false, message: 'Für den Upload wird eine aktuelle Position benötigt.' };
+    return { ok: true, distanceMeters: null };
   }
 
   const distanceMeters = haversineMeters(state.currentCheckpoint.location, location);
@@ -260,6 +274,7 @@ async function main() {
   const server = http.createServer(app);
   const io = new SocketIOServer(server, {
     cors: { origin: true, credentials: true },
+    maxHttpBufferSize: 20_000_000,
   });
   let vite = null;
 
@@ -279,6 +294,36 @@ async function main() {
     res.json({ ok: true, status: state.status });
   });
 
+  // Admin password management: first visitor can set a password via POST /admin/password
+  // and clients can check whether a password is already set via GET /admin/password
+  let adminPassword = process.env.ADMIN_PASSWORD || null;
+
+  app.get('/admin/password', (_, res) => {
+    res.json({ set: !!adminPassword });
+  });
+
+  app.post('/admin/password', (req, res) => {
+    if (adminPassword) {
+      return res.status(403).json({ ok: false, message: 'Admin password is already set.' });
+    }
+    const pwd = req.body && req.body.password ? String(req.body.password).trim() : '';
+    if (!pwd || pwd.length < 4) {
+      return res.status(400).json({ ok: false, message: 'Password too short (min 4 chars).' });
+    }
+    adminPassword = pwd;
+    pushEvent('admin', 'Admin password wurde gesetzt.');
+    broadcast(io);
+    return res.json({ ok: true });
+  });
+
+  app.get('/alert.mp3', (_, res) => {
+    const alertPath = path.resolve(rootDir, 'alert.mp3');
+    if (!fs.existsSync(alertPath)) {
+      return res.status(404).end();
+    }
+    return res.sendFile(alertPath);
+  });
+
   app.get('*', async (req, res) => {
     const indexPath = isProduction ? path.resolve(rootDir, 'dist/client/index.html') : path.resolve(rootDir, 'index.html');
     let template = fs.readFileSync(indexPath, 'utf8');
@@ -293,27 +338,88 @@ async function main() {
   io.on('connection', (socket) => {
     socket.on('join', (payload = {}, callback = () => {}) => {
       const role = payload.role === 'admin' ? 'admin' : 'player';
-      const teamId = TEAM_IDS.includes(payload.teamId) ? payload.teamId : 'red';
-      const displayName = sanitizeText(payload.name, role === 'admin' ? 'Admin' : `${state.teams[teamId].name} Spieler`);
+      const requestedTeam = TEAM_IDS.includes(payload.teamId) ? payload.teamId : null;
+      const displayName = sanitizeText(payload.name, role === 'admin' ? 'Admin' : 'Spieler');
 
       socket.data.role = role;
-      socket.data.teamId = teamId;
       socket.data.name = displayName;
 
+      // code-based join
+      const gameCode = typeof payload.code === 'string' && payload.code.trim() ? payload.code.trim().toUpperCase() : null;
       if (role === 'admin') {
+        // require admin password to be set and provided
+        if (!adminPassword) {
+          callback({ ok: false, message: 'Admin password not set. Bitte setze es unter /admin.' });
+          return;
+        }
+        const pw = payload && payload.password ? String(payload.password) : '';
+        if (pw !== adminPassword) {
+          callback({ ok: false, message: 'Ungültiges Admin-Passwort.' });
+          return;
+        }
         socket.join('admins');
+        socket.data.isAdmin = true;
         callback({ ok: true, state: computeAdminState() });
-      } else {
+        return;
+      }
+
+      if (gameCode) {
+        const codeEntry = codes[gameCode];
+        if (!codeEntry) {
+          callback({ ok: false, message: 'Unbekannter Spielcode.' });
+          return;
+        }
+
+        const teamId = codeEntry.teamId || requestedTeam || 'red';
+
+        socket.data.teamId = teamId;
+        // register in code map
+        codeEntry.members[socket.id] = teamId;
+        codeEntry.teams[teamId].push(socket.id);
+
+        // register in global team state as before
         state.teams[teamId].members[socket.id] = {
           id: socket.id,
           name: displayName,
           joinedAt: nowIso(),
           lastSeenAt: nowIso(),
         };
-        pushEvent('player-join', `${displayName} ist für ${state.teams[teamId].name} beigetreten.`, { teamId });
-        callback({ ok: true, state: computePublicState() });
+        pushEvent('player-join', `${displayName} ist über Code ${gameCode} für ${state.teams[teamId].name} beigetreten.`, { teamId, gameCode });
+        callback({ ok: true, state: computePublicState(), assignedTeam: teamId });
         broadcast(io);
+        return;
       }
+
+      // legacy join without code: behave as before (assign provided or default team)
+      const teamId = requestedTeam || 'red';
+      socket.data.teamId = teamId;
+      state.teams[teamId].members[socket.id] = {
+        id: socket.id,
+        name: displayName,
+        joinedAt: nowIso(),
+        lastSeenAt: nowIso(),
+      };
+      pushEvent('player-join', `${displayName} ist für ${state.teams[teamId].name} beigetreten.`, { teamId });
+      callback({ ok: true, state: computePublicState() });
+      broadcast(io);
+    });
+
+    socket.on('admin:create-code', (payload = {}, callback = () => {}) => {
+      if (!socket.data.isAdmin) {
+        callback({ ok: false, message: 'Nicht autorisiert.' });
+        return;
+      }
+
+      const teamId = TEAM_IDS.includes(payload.teamId) ? payload.teamId : null;
+      if (!teamId) {
+        callback({ ok: false, message: 'Bitte Team Rot oder Blau auswählen.' });
+        return;
+      }
+
+      const next = createTeamCode(teamId);
+      pushEvent('admin-code', `Neuer Spielcode ${next} für ${state.teams[teamId].name} erstellt.`, { code: next, teamId });
+      callback({ ok: true, code: next, teamId, codes: Object.fromEntries(Object.entries(codes).map(([code, value]) => [code, value.teamId])) });
+      broadcast(io);
     });
 
     socket.on('player:position', (payload = {}) => {
@@ -428,8 +534,8 @@ async function main() {
     });
 
     socket.on('admin:start', (payload = {}, callback = () => {}) => {
-      if (payload.token !== adminToken) {
-        callback({ ok: false, message: 'Ungültiger Admin-Token.' });
+      if (!socket.data.isAdmin) {
+        callback({ ok: false, message: 'Nicht autorisiert.' });
         return;
       }
 
@@ -439,8 +545,8 @@ async function main() {
     });
 
     socket.on('admin:reset', (payload = {}, callback = () => {}) => {
-      if (payload.token !== adminToken) {
-        callback({ ok: false, message: 'Ungültiger Admin-Token.' });
+      if (!socket.data.isAdmin) {
+        callback({ ok: false, message: 'Nicht autorisiert.' });
         return;
       }
 
@@ -450,8 +556,8 @@ async function main() {
     });
 
     socket.on('admin:configure', (payload = {}, callback = () => {}) => {
-      if (payload.token !== adminToken) {
-        callback({ ok: false, message: 'Ungültiger Admin-Token.' });
+      if (!socket.data.isAdmin) {
+        callback({ ok: false, message: 'Nicht autorisiert.' });
         return;
       }
 
