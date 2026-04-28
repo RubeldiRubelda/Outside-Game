@@ -534,7 +534,7 @@ async function main() {
         state.status = 'live';
       }
 
-      const isResponseRound = state.currentCheckpoint && state.currentCheckpoint.teamId !== teamId;
+      const isResponseRound = teamId !== state.leadingTeamId;
 
       if (isResponseRound) {
         state.pendingReview = {
