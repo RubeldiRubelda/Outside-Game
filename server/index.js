@@ -539,15 +539,15 @@ async function main() {
       if (isResponseRound) {
         state.pendingReview = {
           id: photo.id,
-          reviewTeamId: state.currentCheckpoint.teamId,
+          reviewTeamId: state.leadingTeamId,
           uploadTeamId: teamId,
           checkpoint: toCheckpoint(photo, team),
         };
         state.status = 'review';
-        state.activeTeamId = state.currentCheckpoint.teamId;
-        pushEvent('photo-review-pending', `${team.name} hat ein Antwortbild gesendet. ${state.teams[state.activeTeamId].name} muss jetzt annehmen oder ablehnen.`, {
+        state.activeTeamId = state.leadingTeamId;
+        pushEvent('photo-review-pending', `${team.name} hat ein Antwortbild gesendet. ${state.teams[state.leadingTeamId].name} muss jetzt annehmen oder ablehnen.`, {
           teamId,
-          reviewTeamId: state.activeTeamId,
+          reviewTeamId: state.leadingTeamId,
           checkpointDistanceMeters: positionCheck.distanceMeters,
         });
       } else {
@@ -575,8 +575,8 @@ async function main() {
         return;
       }
 
-      if (state.pendingReview.reviewTeamId !== teamId) {
-        callback({ ok: false, message: 'Nur das angefragte Team darf dieses Bild prüfen.' });
+      if (teamId !== state.leadingTeamId || state.pendingReview.reviewTeamId !== state.leadingTeamId) {
+        callback({ ok: false, message: 'Nur das Startteam darf Bilder prüfen.' });
         return;
       }
 
