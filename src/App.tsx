@@ -400,6 +400,7 @@ export default function App() {
   const [adminPasswordSet, setAdminPasswordSet] = useState<boolean | null>(null);
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [isOnline, setIsOnline] = useState(() => window.navigator.onLine);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [message, setMessage] = useState('');
   const [manualLat, setManualLat] = useState('48.137');
@@ -419,6 +420,7 @@ export default function App() {
   const [adminPinLabel, setAdminPinLabel] = useState('Standortpin');
   const [adminPinLat, setAdminPinLat] = useState('48.137');
   const [adminPinLng, setAdminPinLng] = useState('11.575');
+  const [requestStatus, setRequestStatus] = useState<{ label: string; phase: 'sending' | 'waiting' | 'done' | 'error' | 'offline'; detail?: string } | null>(null);
 
   const isPlayer = mode === 'player';
   const isAdmin = mode === 'admin';
@@ -506,16 +508,74 @@ export default function App() {
   };
 
   useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+    };
+
+    const handleOffline = () => {
+      setIsOnline(false);
+      setRequestStatus({ label: 'Verbindung', phase: 'offline', detail: 'Gerät ist offline.' });
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  const sendTrackedRequest = <TResponse,>(
+    label: string,
+    eventName: string,
+    payload: Record<string, unknown>,
+    onSuccess: (response: TResponse) => void,
+  ) => {
+    if (!socketRef.current || !connected || !isOnline) {
+      setRequestStatus({ label, phase: 'offline', detail: 'Gerät ist offline oder die Verbindung ist getrennt.' });
+      setMessage('Gerät offline oder nicht verbunden.');
+      return false;
+    }
+
+    setRequestStatus({ label, phase: 'sending', detail: 'Anfrage wird gesendet…' });
+    const waitingTimer = window.setTimeout(() => {
+      setRequestStatus((current) => (current && current.label === label ? { ...current, phase: 'waiting', detail: 'Anfrage ist unterwegs…' } : current));
+    }, 600);
+
+    const timeoutTimer = window.setTimeout(() => {
+      setRequestStatus({ label, phase: 'offline', detail: 'Keine Antwort vom Server.' });
+      setMessage('Keine Antwort vom Server erhalten.');
+    }, 12_000);
+
+    socketRef.current.emit(eventName, payload, (response: TResponse) => {
+      window.clearTimeout(waitingTimer);
+      window.clearTimeout(timeoutTimer);
+      onSuccess(response);
+      setRequestStatus({
+        label,
+        phase: (response as { ok?: boolean }).ok ? 'done' : 'error',
+        detail: (response as { message?: string }).message || ((response as { ok?: boolean }).ok ? 'Anfrage bestätigt.' : 'Anfrage fehlgeschlagen.'),
+      });
+      window.setTimeout(() => setRequestStatus(null), 1800);
+    });
+
+    return true;
+  };
+
+  useEffect(() => {
     const socket = io({ transports: ['websocket'] });
     socketRef.current = socket;
 
     socket.on('connect', () => {
       setConnected(true);
+      setIsOnline(true);
     });
 
     socket.on('disconnect', () => {
       setConnected(false);
       autoJoinAttemptedRef.current = false;
+      setRequestStatus((current) => (current ? { ...current, phase: 'offline', detail: 'Verbindung getrennt.' } : { label: 'Verbindung', phase: 'offline', detail: 'Verbindung getrennt.' }));
     });
     socket.on('state:update', (nextState: Snapshot) => setSnapshot(nextState));
     socket.on('admin:update', (nextState: Snapshot) => setSnapshot(nextState));
@@ -719,8 +779,7 @@ export default function App() {
     window.localStorage.setItem('outside-game-name', name || 'Spieler');
     const nextUrl = buildUrl('player');
     window.history.replaceState({}, '', nextUrl.toString());
-    // send join with code
-    socketRef.current?.emit('join', { role: 'player', code, name }, (res: any) => {
+    const requestSent = sendTrackedRequest<JoinResult>('Beitreten', 'join', { role: 'player', code, name }, (res) => {
       if (!res || !res.ok) {
         setMessage(res?.message || 'Beitritt fehlgeschlagen.');
         setMode('intro');
@@ -735,6 +794,10 @@ export default function App() {
         setMessage(`Du bist Team ${res.assignedTeam || 'rot'}.`);
       }
     });
+
+    if (!requestSent) {
+      setMode('intro');
+    }
   };
 
   const joinAsAdmin = () => {
@@ -745,12 +808,16 @@ export default function App() {
     setMode('admin');
     window.localStorage.setItem('outside-game-admin-password', adminPassword);
     window.history.replaceState({}, '', '/admin');
-    socketRef.current?.emit('join', { role: 'admin', name: 'Admin', password: adminPassword }, (res: any) => {
+    const requestSent = sendTrackedRequest<JoinResult>('Admin-Login', 'join', { role: 'admin', name: 'Admin', password: adminPassword }, (res) => {
       if (res && res.ok && res.state) {
         setSnapshot(res.state);
         setIsAdminAuthenticated(true);
       } else setMessage(res?.message || 'Admin-Login fehlgeschlagen.');
     });
+
+    if (!requestSent) {
+      setMode('intro');
+    }
   };
 
   const sendManualPosition = () => {
@@ -782,27 +849,27 @@ export default function App() {
         reader.readAsDataURL(selectedPhoto);
       });
 
-      socketRef.current.emit(
-        'player:photo',
-        {
-          name: selectedPhoto.name,
-          dataUrl,
-          location,
-        },
-        (response: UploadResult) => {
-          if (response.ok) {
-            setMessage('Foto erfolgreich hochgeladen.');
-            setSelectedPhoto(null);
-            setPhotoPreview(null);
-            if (response.state) {
-              setSnapshot(response.state);
-            }
-          } else {
-            setMessage(response.message || 'Upload fehlgeschlagen.');
+      const requestSent = sendTrackedRequest<UploadResult>('Foto senden', 'player:photo', {
+        name: selectedPhoto.name,
+        dataUrl,
+        location,
+      }, (response) => {
+        if (response.ok) {
+          setMessage('Foto erfolgreich hochgeladen.');
+          setSelectedPhoto(null);
+          setPhotoPreview(null);
+          if (response.state) {
+            setSnapshot(response.state);
           }
-          setIsBusy(false);
-        },
-      );
+        } else {
+          setMessage(response.message || 'Upload fehlgeschlagen.');
+        }
+        setIsBusy(false);
+      });
+
+      if (!requestSent) {
+        setIsBusy(false);
+      }
     } catch (error) {
       setIsBusy(false);
       setMessage(error instanceof Error ? error.message : 'Upload fehlgeschlagen.');
@@ -810,18 +877,14 @@ export default function App() {
   };
 
   const sendReviewDecision = (action: 'accept' | 'reject') => {
-    socketRef.current?.emit(
-      'player:review',
-      { action },
-      (response: JoinResult) => {
-        if (response.ok && response.state) {
-          setSnapshot(response.state);
-          setMessage(action === 'accept' ? 'Bild angenommen.' : 'Bild abgelehnt.');
-        } else {
-          setMessage(response.message || 'Prüfung fehlgeschlagen.');
-        }
-      },
-    );
+    sendTrackedRequest<JoinResult>(action === 'accept' ? 'Bild annehmen' : 'Bild ablehnen', 'player:review', { action }, (response) => {
+      if (response.ok && response.state) {
+        setSnapshot(response.state);
+        setMessage(action === 'accept' ? 'Bild angenommen.' : 'Bild abgelehnt.');
+      } else {
+        setMessage(response.message || 'Prüfung fehlgeschlagen.');
+      }
+    });
   };
 
   const sendAdminTip = () => {
@@ -831,7 +894,7 @@ export default function App() {
       return;
     }
 
-    socketRef.current?.emit('admin:tip', { password: adminPassword, message: text, teamId: adminTipTeam === 'all' ? null : adminTipTeam }, (response: JoinResult) => {
+    sendTrackedRequest<JoinResult>('Tipp senden', 'admin:tip', { password: adminPassword, message: text, teamId: adminTipTeam === 'all' ? null : adminTipTeam }, (response) => {
       if (response.ok && response.state) {
         setSnapshot(response.state);
         setMessage('Tipp gesendet.');
@@ -850,13 +913,13 @@ export default function App() {
       return;
     }
 
-    socketRef.current?.emit('admin:pin', {
+    sendTrackedRequest<JoinResult>('Standortpin senden', 'admin:pin', {
       password: adminPassword,
       label: adminPinLabel,
       lat,
       lng,
       teamId: adminTipTeam === 'all' ? null : adminTipTeam,
-    }, (response: JoinResult) => {
+    }, (response) => {
       if (response.ok && response.state) {
         setSnapshot(response.state);
         setMessage('Standortpin gesendet.');
@@ -867,26 +930,22 @@ export default function App() {
   };
 
   const startGame = () => {
-    socketRef.current?.emit(
-      'admin:start',
-      {
-        password: adminPassword,
-        leadingTeamId: adminLeader,
-        headStartMinutes: Number(adminHeadStart),
-      },
-      (response: JoinResult) => {
-        if (response.ok && response.state) {
-          setSnapshot(response.state);
-          setMessage('Spiel gestartet.');
-        } else {
-          setMessage(response.message || 'Start fehlgeschlagen.');
-        }
-      },
-    );
+    sendTrackedRequest<JoinResult>('Spiel starten', 'admin:start', {
+      password: adminPassword,
+      leadingTeamId: adminLeader,
+      headStartMinutes: Number(adminHeadStart),
+    }, (response) => {
+      if (response.ok && response.state) {
+        setSnapshot(response.state);
+        setMessage('Spiel gestartet.');
+      } else {
+        setMessage(response.message || 'Start fehlgeschlagen.');
+      }
+    });
   };
 
   const createCode = (teamId: TeamId) => {
-    socketRef.current?.emit('admin:create-code', { password: adminPassword, teamId }, (res: any) => {
+    sendTrackedRequest<any>(teamId === 'red' ? 'Code Rot' : 'Code Blau', 'admin:create-code', { password: adminPassword, teamId }, (res) => {
       if (res && res.ok) {
         setMessage(`Neuer ${teamId === 'red' ? 'Rot' : 'Blau'}-Code: ${res.code}`);
         setAdminCodes((current) => ({ ...current, [teamId]: res.code }));
@@ -899,7 +958,7 @@ export default function App() {
   };
 
   const resetGame = () => {
-    socketRef.current?.emit('admin:reset', { password: adminPassword }, (response: JoinResult) => {
+    sendTrackedRequest<JoinResult>('Spiel zurücksetzen', 'admin:reset', { password: adminPassword }, (response) => {
       if (response.ok && response.state) {
         setSnapshot(response.state);
         setMessage('Spiel zurückgesetzt.');
@@ -910,24 +969,20 @@ export default function App() {
   };
 
   const applyAdminConfig = () => {
-    socketRef.current?.emit(
-      'admin:configure',
-      {
-        password: adminPassword,
-        redName: adminInputRed,
-        blueName: adminInputBlue,
-        leadingTeamId: adminLeader,
-        headStartMinutes: Number(adminHeadStart),
-      },
-      (response: JoinResult) => {
-        if (response.ok && response.state) {
-          setSnapshot(response.state);
-          setMessage('Konfiguration gespeichert.');
-        } else {
-          setMessage(response.message || 'Konfiguration fehlgeschlagen.');
-        }
-      },
-    );
+    sendTrackedRequest<JoinResult>('Konfiguration speichern', 'admin:configure', {
+      password: adminPassword,
+      redName: adminInputRed,
+      blueName: adminInputBlue,
+      leadingTeamId: adminLeader,
+      headStartMinutes: Number(adminHeadStart),
+    }, (response) => {
+      if (response.ok && response.state) {
+        setSnapshot(response.state);
+        setMessage('Konfiguration gespeichert.');
+      } else {
+        setMessage(response.message || 'Konfiguration fehlgeschlagen.');
+      }
+    });
   };
 
   const activeCheckpointDistance = useMemo(() => {
@@ -1269,10 +1324,16 @@ export default function App() {
       ) : null}
 
       {message ? <div className="banner">{message}</div> : null}
+      {requestStatus ? (
+        <div className={`request-banner ${requestStatus.phase}`}>
+          <strong>{requestStatus.label}</strong>
+          <span>{requestStatus.detail || (requestStatus.phase === 'sending' ? 'Anfrage läuft…' : requestStatus.phase === 'waiting' ? 'Antwort steht noch aus…' : 'Offline')}</span>
+        </div>
+      ) : null}
       {content}
 
       <footer className="footer">
-        <span>{connected ? 'Socket verbunden' : 'Socket getrennt'}</span>
+        <span>{isOnline && connected ? 'Socket verbunden' : isOnline ? 'Socket getrennt' : 'Gerät offline'}</span>
       </footer>
     </main>
   );

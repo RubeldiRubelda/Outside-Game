@@ -44,3 +44,16 @@ To run the application in a Docker container:
     ```
 
 The application will be available at `http://localhost:777`.
+
+## GitHub Container Registry
+
+This repository now includes a GitHub Actions workflow that publishes a Docker image to GitHub Container Registry on every push to `main` and on version tags.
+
+After the workflow has run successfully, you can pull the image directly:
+
+```bash
+docker pull ghcr.io/rubeldirubelda/outside-game:latest
+docker run --rm -p 777:777 ghcr.io/rubeldirubelda/outside-game:latest
+```
+
+If you run the app behind Cloudflare, make sure WebSockets stay enabled and avoid caching the Socket.IO traffic path. That is usually the quickest way to keep button presses and round updates responsive.

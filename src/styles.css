@@ -278,6 +278,44 @@ h3 {
   color: #c7f6dc;
 }
 
+
+.request-banner {
+  margin-bottom: 18px;
+  padding: 14px 18px;
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(5, 11, 24, 0.74);
+}
+
+.request-banner strong {
+  display: block;
+}
+
+.request-banner span {
+  color: var(--muted);
+}
+
+.request-banner.sending,
+.request-banner.waiting {
+  border-color: rgba(126, 230, 167, 0.34);
+  background: rgba(18, 37, 33, 0.9);
+}
+
+.request-banner.done {
+  border-color: rgba(126, 230, 167, 0.44);
+  background: rgba(16, 44, 35, 0.92);
+}
+
+.request-banner.error,
+.request-banner.offline {
+  border-color: rgba(255, 123, 123, 0.45);
+  background: rgba(54, 15, 19, 0.92);
+}
+
 .setup-grid,
 .dashboard-grid {
   grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.65fr);
