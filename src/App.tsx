@@ -177,6 +177,18 @@ function OpenStreetMapView({ state }: { state: Snapshot | null }) {
       });
     }
 
+    const latestPinEvent = state?.events.find((event) => event.type === 'admin-pin' && event.details && typeof event.details === 'object') || null;
+    const pinLocation = latestPinEvent && typeof latestPinEvent.details.location === 'object' ? latestPinEvent.details.location as { lat?: number; lng?: number } : null;
+    if (pinLocation && Number.isFinite(pinLocation.lat) && Number.isFinite(pinLocation.lng)) {
+      nextPoints.push({
+        id: 'admin-pin',
+        position: [Number(pinLocation.lat), Number(pinLocation.lng)],
+        label: String(latestPinEvent.details.label || latestPinEvent.message || 'Standortpin'),
+        color: '#7ee6a7',
+        type: 'checkpoint',
+      });
+    }
+
     (['red', 'blue'] as TeamId[]).forEach((teamId) => {
       const position = state?.teams[teamId]?.lastPosition;
       if (!position) {
@@ -330,9 +342,15 @@ function buildUrl(mode: ViewMode, teamId?: TeamId) {
   return url;
 }
 
+function readJoinCodeFromLocation() {
+  const code = new URLSearchParams(window.location.search).get('code')?.trim().toUpperCase() || '';
+  return code;
+}
+
 export default function App() {
   const savedTeamCode = window.localStorage.getItem('outside-game-team-code') || '';
   const savedSessionRaw = window.localStorage.getItem('outside-game-session');
+  const urlJoinCode = readJoinCodeFromLocation();
   const socketRef = useRef<Socket | null>(null);
   const autoJoinAttemptedRef = useRef(false);
   const lastAlertEventIdRef = useRef<string | null>(null);
@@ -343,6 +361,9 @@ export default function App() {
     const path = window.location.pathname;
     if (path === '/admin') {
       return 'admin';
+    }
+    if (urlJoinCode) {
+      return 'player';
     }
     if (savedSessionRaw) {
       try {
@@ -362,6 +383,9 @@ export default function App() {
   const [teamId, setTeamId] = useState<TeamId>('red');
   const [name, setName] = useState(() => window.localStorage.getItem('outside-game-name') || '');
   const [gameCode, setGameCode] = useState(() => {
+    if (urlJoinCode) {
+      return urlJoinCode;
+    }
     if (savedSessionRaw) {
       try {
         const parsed = JSON.parse(savedSessionRaw) as { code?: string };
@@ -390,6 +414,11 @@ export default function App() {
   const [adminLeader, setAdminLeader] = useState<TeamId>('red');
   const [locationPermission, setLocationPermission] = useState<'unknown' | 'prompting' | 'granted' | 'denied'>('unknown');
   const [adminCodes, setAdminCodes] = useState<Partial<Record<TeamId, string>>>({});
+  const [adminTipTeam, setAdminTipTeam] = useState<'all' | TeamId>('all');
+  const [adminTipText, setAdminTipText] = useState('');
+  const [adminPinLabel, setAdminPinLabel] = useState('Standortpin');
+  const [adminPinLat, setAdminPinLat] = useState('48.137');
+  const [adminPinLng, setAdminPinLng] = useState('11.575');
 
   const isPlayer = mode === 'player';
   const isAdmin = mode === 'admin';
@@ -434,6 +463,21 @@ export default function App() {
 
     return `Jagd läuft. Dran ist ${TEAM_META[currentState.activeTeamId].name}`;
   }, [currentState, headStartSummary?.expired, headStartSummary?.remainingText]);
+
+  const latestAdminNotice = useMemo(() => {
+    if (!currentState) {
+      return null;
+    }
+
+    return currentState.events.find((event) => {
+      if (event.type !== 'admin-tip' && event.type !== 'admin-pin') {
+        return false;
+      }
+
+      const targetTeamId = event.details?.teamId;
+      return !targetTeamId || targetTeamId === teamId;
+    }) || null;
+  }, [currentState, teamId]);
 
   useEffect(() => {
     if (!photoPreview) {
@@ -780,6 +824,48 @@ export default function App() {
     );
   };
 
+  const sendAdminTip = () => {
+    const text = adminTipText.trim();
+    if (!text) {
+      setMessage('Bitte einen Tipp eingeben.');
+      return;
+    }
+
+    socketRef.current?.emit('admin:tip', { password: adminPassword, message: text, teamId: adminTipTeam === 'all' ? null : adminTipTeam }, (response: JoinResult) => {
+      if (response.ok && response.state) {
+        setSnapshot(response.state);
+        setMessage('Tipp gesendet.');
+        setAdminTipText('');
+      } else {
+        setMessage(response.message || 'Tipp konnte nicht gesendet werden.');
+      }
+    });
+  };
+
+  const sendAdminPin = () => {
+    const lat = Number(adminPinLat);
+    const lng = Number(adminPinLng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      setMessage('Bitte gültige Pin-Koordinaten eingeben.');
+      return;
+    }
+
+    socketRef.current?.emit('admin:pin', {
+      password: adminPassword,
+      label: adminPinLabel,
+      lat,
+      lng,
+      teamId: adminTipTeam === 'all' ? null : adminTipTeam,
+    }, (response: JoinResult) => {
+      if (response.ok && response.state) {
+        setSnapshot(response.state);
+        setMessage('Standortpin gesendet.');
+      } else {
+        setMessage(response.message || 'Pin konnte nicht gesendet werden.');
+      }
+    });
+  };
+
   const startGame = () => {
     socketRef.current?.emit(
       'admin:start',
@@ -859,6 +945,12 @@ export default function App() {
   const isActiveTeamTurn = currentState?.activeTeamId === teamId;
   const pendingReview = currentState?.pendingReview;
   const isReviewTeam = pendingReview?.reviewTeamId === teamId;
+  const canUploadPhoto = Boolean(
+    currentState && (
+      (currentState.status === 'head_start' && headStartSummary?.expired && teamId === currentState.leadingTeamId) ||
+      (currentState.status === 'live' && isActiveTeamTurn && !pendingReview)
+    ),
+  );
 
   const introHint = locationPermission === 'prompting'
     ? 'Standort wird angefragt…'
@@ -886,6 +978,21 @@ export default function App() {
           <div className="mini-card"><span className="card-label"><span className="material-icons">photo_camera</span> Letztes Foto</span><strong>{activeTeam?.lastUpload ? formatDateTime(activeTeam.lastUpload.createdAt) : 'noch keines'}</strong></div>
           <div className={`mini-card ${headStartSummary?.expired ? 'warning-card' : ''}`}><span className="card-label"><span className="material-icons">timer</span> Vorsprung</span><strong>{currentState?.status === 'head_start' ? (headStartSummary?.expired ? 'abgelaufen' : headStartSummary?.remainingText ?? '…') : 'bereits vorbei'}</strong></div>
         </div>
+
+        {latestAdminNotice ? (
+          <div className="challenge-card admin-notice-card">
+            <p className="card-label">
+              <span className="material-icons">campaign</span>
+              {latestAdminNotice.type === 'admin-pin' ? 'Standortpin' : 'Tipp vom Admin'}
+            </p>
+            <h3>{String(latestAdminNotice.message)}</h3>
+            {latestAdminNotice.type === 'admin-pin' ? (
+              <p className="muted">
+                Ziel: {Number(latestAdminNotice.details?.location?.lat).toFixed(5)}, {Number(latestAdminNotice.details?.location?.lng).toFixed(5)}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
 
         {currentState?.currentCheckpoint?.preview ? (
           <div className="challenge-card">
@@ -929,17 +1036,21 @@ export default function App() {
 
         {currentState?.status === 'head_start' && (
           <div className={`card ${headStartSummary?.expired ? 'alert-card' : ''}`}>
-            <h3>{headStartSummary?.expired ? 'Jetzt ist Aktion nötig' : 'Vorsprung aktiv'}</h3>
+            <h3>{headStartSummary?.expired ? (teamId === currentState.leadingTeamId ? 'Jetzt ist Aktion nötig' : 'Der Vorsprung ist abgelaufen') : 'Vorsprung aktiv'}</h3>
             <div className="countdown" style={{ fontSize: '2.5rem', margin: '1rem 0' }}>{headStartSummary?.remainingText ?? '…'}</div>
-            <p>{headStartSummary?.expired ? 'Der Vorsprung ist abgelaufen. Jetzt muss das nächste Foto gesendet werden.' : 'Nutze die Zeit, bevor das andere Team wieder dran ist.'}</p>
+            <p>
+              {headStartSummary?.expired
+                ? (teamId === currentState.leadingTeamId ? 'Jetzt muss das erste Foto aufgenommen und hochgeladen werden.' : 'Warte, bis das Startteam sein erstes Foto hochlädt.')
+                : (teamId === currentState.leadingTeamId ? 'Du bist das Startteam. Halte das erste Foto bereit.' : 'Das Startteam hat noch Vorsprung.')}
+            </p>
           </div>
         )}
 
-        {currentState?.status === 'live' && isActiveTeamTurn && !pendingReview && (
+        {canUploadPhoto && (
           <div className="upload-panel">
             <label className="button primary">
               <span className="material-icons">photo_camera</span>
-              Foto auswählen
+              Foto aufnehmen oder auswählen
               <input type="file" accept="image/*" capture="environment" onChange={(event) => {
                 const file = event.target.files?.[0] || null;
                 setSelectedPhoto(file);
@@ -955,14 +1066,14 @@ export default function App() {
             <div className="button-row">
               <button className="primary" disabled={isBusy || !selectedPhoto} onClick={submitPhoto}>
                 <span className="material-icons">upload</span>
-                {isBusy ? 'Wird hochgeladen…' : 'Als da bestätigen'}
+                {isBusy ? 'Wird hochgeladen…' : 'Foto senden'}
               </button>
               <button className="secondary" onClick={requestLocationAccess}>
                 <span className="material-icons">my_location</span>
                 Standort freigeben
               </button>
             </div>
-            <p className="muted">{currentState?.status === 'head_start' ? (headStartSummary?.expired ? 'Der Vorsprung ist abgelaufen.' : 'Der Vorsprung läuft noch.') : 'Ein Foto reicht zur Bestätigung.'}</p>
+            <p className="muted">{currentState?.status === 'head_start' ? 'Das Foto startet die nächste Runde.' : 'Ein Foto reicht zur Bestätigung.'}</p>
           </div>
         )}
 
@@ -1055,6 +1166,17 @@ export default function App() {
                   <option value="blue">Team Blau</option>
                 </select>
               </label>
+              <label>Hinweis für Team
+                <select value={adminTipTeam} onChange={(event) => setAdminTipTeam(event.target.value === 'all' ? 'all' : (event.target.value as TeamId))}>
+                  <option value="all">Alle Teams</option>
+                  <option value="red">Team Rot</option>
+                  <option value="blue">Team Blau</option>
+                </select>
+              </label>
+              <label>Tipptext<input value={adminTipText} onChange={(event) => setAdminTipText(event.target.value)} placeholder="z. B. Sucht beim roten Tor" /></label>
+              <label>Pin-Bezeichnung<input value={adminPinLabel} onChange={(event) => setAdminPinLabel(event.target.value)} placeholder="Standortpin" /></label>
+              <label>Pin Breite<input value={adminPinLat} onChange={(event) => setAdminPinLat(event.target.value)} /></label>
+              <label>Pin Länge<input value={adminPinLng} onChange={(event) => setAdminPinLng(event.target.value)} /></label>
             </div>
 
             <div className="button-row">
@@ -1062,6 +1184,8 @@ export default function App() {
               <button className="primary" onClick={startGame}><span className="material-icons">play_arrow</span>Spiel starten</button>
               <button className="primary" onClick={() => createCode('red')}>Code Rot</button>
               <button className="primary" onClick={() => createCode('blue')}>Code Blau</button>
+              <button className="secondary" onClick={sendAdminTip}><span className="material-icons">campaign</span>Tipp senden</button>
+              <button className="secondary" onClick={sendAdminPin}><span className="material-icons">place</span>Pin senden</button>
             </div>
 
             <div className="status-card-grid">

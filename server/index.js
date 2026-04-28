@@ -658,6 +658,44 @@ async function main() {
       broadcast(io);
     });
 
+    socket.on('admin:tip', (payload = {}, callback = () => {}) => {
+      if (!socket.data.isAdmin) {
+        callback({ ok: false, message: 'Nicht autorisiert.' });
+        return;
+      }
+
+      const message = sanitizeText(payload.message, '');
+      if (!message) {
+        callback({ ok: false, message: 'Bitte einen Tipptext eingeben.' });
+        return;
+      }
+
+      const teamId = TEAM_IDS.includes(payload.teamId) ? payload.teamId : null;
+      pushEvent('admin-tip', message, { teamId });
+      callback({ ok: true, state: computeAdminState() });
+      broadcast(io);
+    });
+
+    socket.on('admin:pin', (payload = {}, callback = () => {}) => {
+      if (!socket.data.isAdmin) {
+        callback({ ok: false, message: 'Nicht autorisiert.' });
+        return;
+      }
+
+      const lat = Number(payload.lat);
+      const lng = Number(payload.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        callback({ ok: false, message: 'Bitte gültige Koordinaten für den Pin eingeben.' });
+        return;
+      }
+
+      const teamId = TEAM_IDS.includes(payload.teamId) ? payload.teamId : null;
+      const label = sanitizeText(payload.label, 'Standortpin');
+      pushEvent('admin-pin', label, { teamId, location: { lat, lng } });
+      callback({ ok: true, state: computeAdminState() });
+      broadcast(io);
+    });
+
     socket.on('disconnect', () => {
       const teamId = socket.data.teamId;
       if (TEAM_IDS.includes(teamId) && state.teams[teamId].members[socket.id]) {
