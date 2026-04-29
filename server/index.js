@@ -18,6 +18,7 @@ const MAX_EVENTS = 50;
 const CHEAT_RADIUS_METERS = 45;
 const STALE_LOCATION_MS = 20_000;
 const IMPOSSIBLE_SPEED_KMH = 90;
+const persistencePath = path.resolve(rootDir, 'data', 'game-state.json');
 
 function createTeam(id, name, color) {
   return {
@@ -55,8 +56,9 @@ function createState() {
   };
 }
 
-const state = createState();
-const codes = {}; // map gameCode -> { createdAt, teamId, members: { socketId: teamId }, teams: { red: [socketIds], blue: [socketIds] } }
+let state = createState();
+let codes = {}; // map gameCode -> { createdAt, teamId, members: { socketId: teamId }, teams: { red: [socketIds], blue: [socketIds] } }
+let persistTimer = null;
 
 function generateCode(length = 6) {
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
@@ -69,6 +71,7 @@ function createTeamCode(teamId) {
   let next = generateCode();
   while (codes[next]) next = generateCode();
   codes[next] = { createdAt: nowIso(), teamId, members: {}, teams: { red: [], blue: [] } };
+  schedulePersistGameState();
   return next;
 }
 
@@ -76,9 +79,116 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function hydrateTeam(team, fallback) {
+  return {
+    ...fallback,
+    ...team,
+    members: {},
+    flags: Array.isArray(team?.flags) ? team.flags : fallback.flags,
+  };
+}
+
+function hydrateState(rawState) {
+  const next = createState();
+  if (!rawState || typeof rawState !== 'object') {
+    return next;
+  }
+
+  return {
+    ...next,
+    ...rawState,
+    settings: {
+      ...next.settings,
+      ...(rawState.settings && typeof rawState.settings === 'object' ? rawState.settings : {}),
+    },
+    teams: {
+      red: hydrateTeam(rawState.teams?.red, next.teams.red),
+      blue: hydrateTeam(rawState.teams?.blue, next.teams.blue),
+    },
+  };
+}
+
+function hydrateCodes(rawCodes) {
+  const next = {};
+  if (!rawCodes || typeof rawCodes !== 'object') {
+    return next;
+  }
+
+  for (const [code, entry] of Object.entries(rawCodes)) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const teamId = TEAM_IDS.includes(entry.teamId) ? entry.teamId : 'red';
+    next[code] = {
+      createdAt: typeof entry.createdAt === 'string' ? entry.createdAt : nowIso(),
+      teamId,
+      members: {},
+      teams: { red: [], blue: [] },
+    };
+  }
+
+  return next;
+}
+
+function snapshotPersistence() {
+  return {
+    state: {
+      ...state,
+      teams: {
+        red: { ...state.teams.red, members: {} },
+        blue: { ...state.teams.blue, members: {} },
+      },
+    },
+    codes: Object.fromEntries(
+      Object.entries(codes).map(([code, entry]) => [code, { createdAt: entry.createdAt, teamId: entry.teamId }]),
+    ),
+  };
+}
+
+function persistGameState() {
+  fs.mkdirSync(path.dirname(persistencePath), { recursive: true });
+  fs.writeFileSync(persistencePath, JSON.stringify(snapshotPersistence(), null, 2));
+}
+
+function schedulePersistGameState() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+  }
+
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try {
+      persistGameState();
+    } catch (error) {
+      console.warn('Could not persist game state:', error);
+    }
+  }, 100);
+
+  persistTimer.unref?.();
+}
+
+function loadPersistedGameState() {
+  if (!fs.existsSync(persistencePath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(persistencePath, 'utf8'));
+  } catch (error) {
+    console.warn('Could not read persisted game state:', error);
+    return null;
+  }
+}
+
+const persistedGameState = loadPersistedGameState();
+state = hydrateState(persistedGameState?.state);
+codes = hydrateCodes(persistedGameState?.codes);
+
 function pushEvent(type, message, details = {}) {
   state.events.unshift({ id: crypto.randomUUID(), type, message, details, time: nowIso() });
   state.events = state.events.slice(0, MAX_EVENTS);
+  schedulePersistGameState();
 }
 
 function otherTeamId(teamId) {
@@ -150,6 +260,11 @@ function computePublicState() {
 function computeAdminState() {
   return {
     ...computePublicState(),
+    joinCodes: Object.entries(codes).map(([code, entry]) => ({
+      code,
+      teamId: entry.teamId,
+      createdAt: entry.createdAt,
+    })),
     teams: {
       red: {
         ...computePublicTeam(state.teams.red),
@@ -205,6 +320,7 @@ function startGame(io, options = {}) {
     leadingTeamId: state.leadingTeamId,
     headStartMinutes: state.headStartMinutes,
   });
+  schedulePersistGameState();
 }
 
 function resetGame() {
@@ -222,6 +338,7 @@ function resetGame() {
   state.teams.red = nextState.teams.red;
   state.teams.blue = nextState.teams.blue;
   pushEvent('game-reset', 'Spielstatus wurde zurückgesetzt.');
+  schedulePersistGameState();
 }
 
 function canUpload(teamId) {
@@ -483,6 +600,7 @@ async function main() {
 
       updateTeamFlags(teamId);
       broadcast(io);
+      schedulePersistGameState();
     });
 
     socket.on('player:photo', (payload = {}, callback = () => {}) => {
@@ -561,6 +679,7 @@ async function main() {
 
       callback({ ok: true, state: computePublicState() });
       broadcast(io);
+      schedulePersistGameState();
     });
 
     socket.on('player:review', (payload = {}, callback = () => {}) => {
@@ -587,7 +706,7 @@ async function main() {
 
       if (action === 'accept') {
         state.currentCheckpoint = review.checkpoint;
-        state.activeTeamId = teamId;
+        state.activeTeamId = review.uploadTeamId;
         state.pendingReview = null;
         state.status = 'live';
         pushEvent('photo-approved', `${reviewerTeam.name} hat das Bild von ${uploaderTeam.name} angenommen.`, {
@@ -606,6 +725,7 @@ async function main() {
 
       callback({ ok: true, state: computePublicState() });
       broadcast(io);
+      schedulePersistGameState();
     });
 
     socket.on('admin:start', (payload = {}, callback = () => {}) => {
@@ -617,6 +737,7 @@ async function main() {
       startGame(io, payload);
       callback({ ok: true, state: computeAdminState() });
       broadcast(io);
+      schedulePersistGameState();
     });
 
     socket.on('admin:reset', (payload = {}, callback = () => {}) => {
@@ -628,6 +749,7 @@ async function main() {
       resetGame();
       callback({ ok: true, state: computeAdminState() });
       broadcast(io);
+      schedulePersistGameState();
     });
 
     socket.on('admin:configure', (payload = {}, callback = () => {}) => {
@@ -656,6 +778,7 @@ async function main() {
 
       callback({ ok: true, state: computeAdminState() });
       broadcast(io);
+      schedulePersistGameState();
     });
 
     socket.on('admin:tip', (payload = {}, callback = () => {}) => {

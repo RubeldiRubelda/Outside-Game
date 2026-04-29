@@ -403,6 +403,18 @@ label {
   background: rgba(7, 14, 27, 0.76);
 }
 
+.selectable-card {
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+}
+
+.selectable-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(126, 230, 167, 0.24);
+}
+
 .mini-card,
 .team-card,
 .event-item,

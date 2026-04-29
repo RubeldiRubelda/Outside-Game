@@ -72,9 +72,10 @@ type Snapshot = {
     impossibleSpeedKmh: number;
   };
   teams: Record<TeamId, TeamSummary>;
+  joinCodes?: Array<{ code: string; teamId: TeamId; createdAt: string }>;
 };
 
-type JoinResult = { ok: boolean; message?: string; state?: Snapshot };
+type JoinResult = { ok: boolean; message?: string; state?: Snapshot; assignedTeam?: TeamId };
 type UploadResult = JoinResult;
 
 const TEAM_META: Record<TeamId, { name: string; accent: string; label: string }> = {
@@ -178,12 +179,13 @@ function OpenStreetMapView({ state }: { state: Snapshot | null }) {
     }
 
     const latestPinEvent = state?.events.find((event) => event.type === 'admin-pin' && event.details && typeof event.details === 'object') || null;
-    const pinLocation = latestPinEvent && typeof latestPinEvent.details.location === 'object' ? latestPinEvent.details.location as { lat?: number; lng?: number } : null;
+    const latestPinDetails = latestPinEvent?.details as { label?: string; location?: { lat?: number; lng?: number } } | undefined;
+    const pinLocation = latestPinDetails?.location || null;
     if (pinLocation && Number.isFinite(pinLocation.lat) && Number.isFinite(pinLocation.lng)) {
       nextPoints.push({
         id: 'admin-pin',
         position: [Number(pinLocation.lat), Number(pinLocation.lng)],
-        label: String(latestPinEvent.details.label || latestPinEvent.message || 'Standortpin'),
+        label: String(latestPinDetails?.label || latestPinEvent?.message || 'Standortpin'),
         color: '#7ee6a7',
         type: 'checkpoint',
       });
@@ -784,7 +786,9 @@ export default function App() {
         setMessage(res?.message || 'Beitritt fehlgeschlagen.');
         setMode('intro');
       } else {
-        setSnapshot(res.state);
+        if (res.state) {
+          setSnapshot(res.state);
+        }
         if (res.assignedTeam === 'red' || res.assignedTeam === 'blue') {
           setTeamId(res.assignedTeam);
           window.localStorage.setItem('outside-game-team-code', code);
@@ -1041,11 +1045,14 @@ export default function App() {
               {latestAdminNotice.type === 'admin-pin' ? 'Standortpin' : 'Tipp vom Admin'}
             </p>
             <h3>{String(latestAdminNotice.message)}</h3>
-            {latestAdminNotice.type === 'admin-pin' ? (
-              <p className="muted">
-                Ziel: {Number(latestAdminNotice.details?.location?.lat).toFixed(5)}, {Number(latestAdminNotice.details?.location?.lng).toFixed(5)}
-              </p>
-            ) : null}
+            {latestAdminNotice.type === 'admin-pin' ? (() => {
+              const pin = latestAdminNotice.details?.location as { lat?: number; lng?: number } | undefined;
+              return pin && Number.isFinite(pin.lat) && Number.isFinite(pin.lng) ? (
+                <p className="muted">
+                  Ziel: {Number(pin.lat).toFixed(5)}, {Number(pin.lng).toFixed(5)}
+                </p>
+              ) : null;
+            })() : null}
           </div>
         ) : null}
 
@@ -1247,6 +1254,26 @@ export default function App() {
               <div className="mini-card"><span className="card-label">Rot-Code</span><strong>{adminCodes.red || 'noch keiner'}</strong></div>
               <div className="mini-card"><span className="card-label">Blau-Code</span><strong>{adminCodes.blue || 'noch keiner'}</strong></div>
             </div>
+
+            {currentState?.joinCodes?.length ? (
+              <div className="status-card-grid">
+                {currentState.joinCodes.map((entry) => (
+                  <button
+                    key={entry.code}
+                    type="button"
+                    className="mini-card selectable-card"
+                    onClick={() => {
+                      setGameCode(entry.code);
+                      setMessage(`Code ${entry.code} in das Join-Feld übernommen.`);
+                    }}
+                  >
+                    <span className="card-label">Laufender Code</span>
+                    <strong>{entry.code}</strong>
+                    <span className="muted">{TEAM_META[entry.teamId].name}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
 
             <div className="qr-grid">
               <QrCodeView code={adminCodes.red || ''} teamId="red" />
